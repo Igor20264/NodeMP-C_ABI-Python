@@ -1,0 +1,9 @@
+name = "suite-python"
+version = "1.0"
+type = "python"
+
+# /suite start | stop | status
+# Спавна нет. Один ресурс suite за раз.
+
+[server]
+main = "server/main.py"

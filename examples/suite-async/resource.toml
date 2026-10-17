@@ -1,0 +1,9 @@
+name = "suite-async"
+version = "1.0"
+type = "python"
+
+# /suite start | stop | status
+# Спавна нет. От suite-python отличается только ожидание: await node.job.
+
+[server]
+main = "server/main.py"
