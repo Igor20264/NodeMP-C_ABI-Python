@@ -1,6 +1,6 @@
-# Событие можно отпустить сразу. Запрос — нет: клиент ждёт вердикт,
-# пока функция не вернулась. async def здесь не запускается. Для запроса
-# корутина ещё и читается как разрешение.
+# Запрос отвечает до выхода из функции. async def у запроса нельзя останавливать
+# на await: клиент ждёт вердикт сразу. Событие можно писать как async def.
+# await node.job ждёт закреплённое ядро и не держит worker.
 
 import time
 
@@ -27,18 +27,12 @@ def prepare(player_id, name):
     }
 
 
-def deliver(result, error):
-    if error:
-        node.log_error(error)
-        return
-    node.log_info(f"python-async: welcome for {result['name']} ready on core {result['core']}")
-    node.emit_client(result["player_id"], "greeting", f"Welcome, {result['name']}")
-
-
-def on_join(player_id):
+async def on_join(player_id):
     name = node.get_player_name(player_id) or "?"
     node.log_info(f"python-async: queued welcome for {name}")
-    node.job(prepare, player_id, name, done=deliver)
+    result = await node.job(prepare, player_id, name)
+    node.log_info(f"python-async: welcome for {result['name']} ready on core {result['core']}")
+    node.emit_client(result["player_id"], "greeting", f"Welcome, {result['name']}")
 
 
 def census(ids):
@@ -48,19 +42,13 @@ def census(ids):
     return {"names": names, "core": node.core_info()["index"]}
 
 
-def show_census(result, error):
-    if error:
-        node.log_error(error)
-        return
+async def on_census(timer_id):
+    del timer_id
+    result = await node.job(census, list(node.get_players()))
     listed = ", ".join(result["names"]) if result["names"] else "nobody"
     node.log_info(
         f"python-async: {len(result['names'])} online ({listed}) counted on core {result['core']}"
     )
-
-
-def on_census(timer_id):
-    del timer_id
-    node.job(census, list(node.get_players()), done=show_census)
 
 
 node.on("playerConnectRequest", on_connect)
@@ -68,7 +56,7 @@ node.on("playerJoined", on_join)
 clock = node.every(60000, on_census)
 
 for player_id in node.get_players():
-    on_join(player_id)
+    node.spawn(on_join(player_id))
 
 node.log_info("python-async loaded")
 

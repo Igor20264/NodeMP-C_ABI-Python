@@ -2,10 +2,9 @@ name = "python-async"
 version = "1.0"
 type = "python"
 
-# Запрет входа отвечает сразу. Приветствие и перекличка считаются на
-# закреплённом ядре через node.job, а готовый результат возвращается на worker.
-# Скопируйте всю папку в resources/. Нужны те же pyhost.dll и python315.dll,
-# что и для python-gate.
+# Запрет входа отвечает сразу. Приветствие и перекличка — async def:
+# await node.job считает на закреплённом ядре и возвращает результат на worker.
+# Скопируйте всю папку в resources/. Нужен тот же pyhost, что и для python-gate.
 
 [server]
 main = "server/main.py"

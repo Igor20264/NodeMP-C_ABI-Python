@@ -1,0 +1,12 @@
+name = "loadtest"
+version = "1.0"
+type = "python"
+
+# Нагрузка по команде из чата. Само не стартует.
+# /load start [секунды] [чтений за тик] [задач на ядро за тик]
+# /load stop
+# /load status
+# /load spawn [сколько]
+
+[server]
+main = "server/main.py"

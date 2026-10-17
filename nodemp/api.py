@@ -6,8 +6,12 @@ pinned core; ``submit_job`` uses the server pool, which is not pinned.
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
+import heapq
+import inspect
 import json
+import math
 import traceback
 from contextlib import contextmanager
 
@@ -39,6 +43,10 @@ _next_slot = 0
 _SLOTS: dict[int, "Slot"] = {}
 _TIMERS: dict[int, int] = {}
 _relay_warned = False
+_host_loop = None
+_pump_armed = False
+_pump_hook = None
+_tasks: set[asyncio.Task] = set()
 
 
 class NodeError(RuntimeError):
@@ -84,21 +92,28 @@ class Bridge:
     def __init__(self):
         self.raw = None
         self.size = 0
+        self._bound: dict[str, object] = {}
 
     def bind(self, addr: int) -> None:
         self.raw = NodeApi.from_address(int(addr))
         self.size = int(self.raw.struct_size)
+        self._bound = {}
         major = int(self.raw.abi_version) >> 16
         if major != ABI_MAJOR:
             raise NodeError(f"server ABI major is {major}, this host was generated for {ABI_MAJOR}")
 
     def fn(self, name: str):
+        found = self._bound.get(name)
+        if found is not None:
+            return found
         if self.raw is None:
             raise NodeError("python host is not connected to a server")
         spec = CATALOG[name]
         if spec["offset"] + 8 > self.size:
             raise NodeError(f"{name} is not provided by this server")
-        return getattr(self.raw, name)
+        found = getattr(self.raw, name)
+        self._bound[name] = found
+        return found
 
     def call(self, name: str, *args):
         return self.fn(name)(*_prepare(name, args))
@@ -106,9 +121,17 @@ class Bridge:
     def text(self, name: str, *args):
         fn = self.fn(name)
         args = _prepare(name, args)
+        # A real buffer first. This server answers -1 to the NULL size probe,
+        # so a name query never got past the probe and came back empty.
+        buf = ctypes.create_string_buffer(512)
+        written = fn(*args, buf, len(buf))
+        if isinstance(written, int) and 0 <= written < len(buf):
+            return buf.raw[:written].decode("utf-8", "replace")
         size = fn(*args, None, 0)
         if not isinstance(size, int) or size < 0:
             return None
+        if size == 0:
+            return ""
         buf = ctypes.create_string_buffer(size + 1)
         written = fn(*args, buf, size + 1)
         if not isinstance(written, int) or written < 0:
@@ -129,6 +152,8 @@ def _bytes(value) -> bytes | None:
 
 def _prepare(name: str, args: tuple) -> tuple:
     kinds = CATALOG[name]["kinds"]
+    if "cstr" not in kinds:
+        return args
     cooked = []
     for index, value in enumerate(args):
         if index < len(kinds) and kinds[index] == "cstr":
@@ -182,15 +207,123 @@ def drop_resource(res) -> None:
         stale = [tid for tid, sid in _TIMERS.items() if sid not in _SLOTS]
         for tid in stale:
             _TIMERS.pop(tid, None)
+    pending = [task for task in list(_tasks) if getattr(task, "_nodemp_resource", None) is res]
+    for task in pending:
+        task.cancel()
+    if pending:
+        _wake()
 
 
-def _invoke(slot: Slot, args, log: bool = True):
+def _host_loop_get() -> asyncio.AbstractEventLoop:
+    global _host_loop
+    if _host_loop is None or _host_loop.is_closed():
+        _host_loop = asyncio.new_event_loop()
+    return _host_loop
+
+
+def _next_delay_ms(loop: asyncio.AbstractEventLoop) -> int | None:
+    if loop._ready:
+        return 0
+    scheduled = loop._scheduled
+    while scheduled and scheduled[0].cancelled():
+        heapq.heappop(scheduled)
+    if not scheduled:
+        return None
+    delay = scheduled[0].when() - loop.time()
+    if delay <= 0:
+        return 0
+    return max(1, math.ceil(delay * 1000))
+
+
+def _arm_pump(ms: int) -> None:
+    global _pump_armed
+    if _pump_armed:
+        return
+    _pump_armed = True
+    if _pump_hook is not None:
+        _pump_hook(int(ms))
+        return
+    token = current.set(None)
+    try:
+        slot = _alloc("timeout", _run_pump)
+    finally:
+        current.reset(token)
+    timer_id = bridge.call("set_timeout", int(ms), _on_timer, ctypes.c_void_p(slot.id))
+    if not isinstance(timer_id, int) or timer_id < 0:
+        _pump_armed = False
+        _drop(slot.id)
+        return
+    slot.timer_id = int(timer_id)
+    with slots_lock:
+        _TIMERS[slot.timer_id] = slot.id
+
+
+def _wake() -> None:
+    loop = _host_loop
+    if loop is None or loop.is_running() or _pump_hook is not None:
+        _arm_pump(0)
+        return
+    _run_pump()
+
+
+def _run_pump(_timer_id: int = 0) -> None:
+    global _pump_armed
+    _pump_armed = False
+    loop = _host_loop_get()
+    if loop.is_running():
+        _arm_pump(0)
+        return
+    loop.call_soon(loop.stop)
+    loop.run_forever()
+    delay = _next_delay_ms(loop)
+    if delay is not None:
+        _arm_pump(delay)
+
+
+async def _guard(coro):
+    try:
+        return await coro
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log_exc()
+        return None
+
+
+def spawn_coro(coro):
+    if not inspect.iscoroutine(coro):
+        raise TypeError("spawn expects a coroutine")
+    loop = _host_loop_get()
+    task = loop.create_task(_guard(coro))
+    task._nodemp_resource = current.get()
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+    _wake()
+    return task
+
+
+def _finish_sync(coro):
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        return stop.value
+    coro.close()
+    raise RuntimeError("a request handler has to answer before the first await")
+
+
+def _invoke(slot: Slot, args, log: bool = True, sync: bool = False):
     res = slot.resource
     if res is not None and not res.alive:
         return None
     token = current.set(res) if res is not None else None
     try:
-        return slot.fn(*args)
+        result = slot.fn(*args)
+        if inspect.iscoroutine(result):
+            if sync:
+                return _finish_sync(result)
+            spawn_coro(result)
+            return None
+        return result
     except Exception:
         if log:
             _log_exc()
@@ -254,7 +387,7 @@ def _on_request(player_id, global_id, data, reason, reason_cap, user):
     slot = _get(user)
     if slot is None:
         return 0
-    result = _invoke(slot, (int(player_id), int(global_id), _as_text(data)))
+    result = _invoke(slot, (int(player_id), int(global_id), _as_text(data)), sync=True)
     if result is _RAISED or result is False or isinstance(result, str):
         if isinstance(result, str):
             _write_reason(reason, int(reason_cap), result)
@@ -493,6 +626,7 @@ class Node:
         """Deny with ``False`` or a reason string. ``None`` or ``True`` allows.
 
         A handler that raises is a deny, and the traceback is logged.
+        ``async def`` may be used only when it answers before the first ``await``.
         """
         return self._bind_event("cancellable", name, fn, _on_request)
 
@@ -665,17 +799,36 @@ class Node:
             raise NodeError("submit_job failed")
         return Handle("pool", slot.id)
 
+    def spawn(self, coro):
+        """Run a coroutine on the worker. The worker stays free while it waits."""
+        return spawn_coro(coro)
+
     def job(self, fn, *args, done=None):
         """Run ``fn(*args)`` on the pinned core. ``done(result, error)`` runs on the worker.
 
-        ``error`` is a traceback string, or None. Do not wait inside ``fn`` for ``done``:
-        ``done`` is delivered on the worker after ``fn`` returns.
+        Inside ``async def``, ``await node.job(...)`` returns the value. A failure raises
+        ``NodeError``. ``error`` for ``done`` is a traceback string, or None. Do not wait
+        inside ``fn`` for ``done``: ``done`` is delivered on the worker after ``fn`` returns.
         """
         if not callable(fn):
             raise TypeError("job function must be callable")
         if done is not None and not callable(done):
             raise TypeError("done must be callable")
         res = current.get()
+        fut = None
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None and asyncio.current_task(running) is not None:
+            fut = running.create_future()
+
+            def _retrieve(done_fut, _fut=fut):
+                del _fut
+                if not done_fut.cancelled():
+                    done_fut.exception()
+
+            fut.add_done_callback(_retrieve)
 
         def run(_fn=fn, _args=args, _res=res):
             token = current.set(_res) if _res is not None else None
@@ -687,9 +840,15 @@ class Node:
                 if token is not None:
                     current.reset(token)
 
-        def finish(result, error, _done=done, _res=res):
-            if _done is None:
+        def finish(result, error, _done=done, _res=res, _fut=fut):
+            if _fut is not None and not _fut.done():
                 if error:
+                    _fut.set_exception(NodeError(error))
+                else:
+                    _fut.set_result(result)
+                _wake()
+            if _done is None:
+                if error and _fut is None:
                     try:
                         bridge.call("log_error", error)
                     except Exception:
@@ -707,7 +866,7 @@ class Node:
         import _nodemp
 
         _nodemp.core_submit(run, finish)
-        return None
+        return fut
 
     def core_info(self) -> dict:
         import _nodemp

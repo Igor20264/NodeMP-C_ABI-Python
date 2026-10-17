@@ -31,32 +31,92 @@ _hook = False
 _real_system = None
 
 
+_root_cache: dict[str, str | None] = {}
+_prefix_norm: list[str] | None = None
+_has_untrusted = False
+
+
+def _norm_root(root) -> str | None:
+    try:
+        return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(root))))
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _cached_root(root) -> str | None:
+    if not root:
+        return None
+    key = root if isinstance(root, str) else os.fspath(root)
+    if key in _root_cache:
+        return _root_cache[key]
+    base = _norm_root(key)
+    _root_cache[key] = base
+    return base
+
+
 def path_allowed(path, roots) -> bool:
     try:
-        candidate = os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path))))
+        cheap = os.path.normcase(os.path.abspath(os.fspath(path)))
     except (OSError, TypeError, ValueError):
         return False
+    bases = []
     for root in roots:
-        if not root:
+        base = _cached_root(root)
+        if not base:
             continue
-        try:
-            base = os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(root))))
-        except (OSError, TypeError, ValueError):
-            continue
+        bases.append(base)
+        if cheap == base or cheap.startswith(base + os.sep):
+            return True
+    if not bases:
+        return False
+    try:
+        candidate = os.path.normcase(os.path.realpath(cheap))
+    except (OSError, TypeError, ValueError):
+        return False
+    if candidate == cheap:
+        return False
+    for base in bases:
         if candidate == base or candidate.startswith(base + os.sep):
             return True
     return False
 
 
+def _site_roots() -> list[str]:
+    found = []
+    try:
+        import site
+
+        user = site.getusersitepackages()
+        if isinstance(user, str):
+            found.append(user)
+        for value in site.getsitepackages():
+            if value:
+                found.append(value)
+    except Exception:
+        return found
+    return found
+
+
+def _note_trust() -> None:
+    global _has_untrusted
+    with resources_lock:
+        _has_untrusted = any(res.alive and not res.trusted for res in resources.values())
+
+
 def prefix_roots() -> list[str]:
+    global _prefix_norm
+    if _prefix_norm is not None:
+        return _prefix_norm
     roots = []
     for value in (
         getattr(sys, "base_prefix", None),
         getattr(sys, "prefix", None),
         getattr(sys, "_stdlib_dir", None),
+        *_site_roots(),
     ):
         if value and value not in roots:
             roots.append(value)
+    _prefix_norm = roots
     return roots
 
 
@@ -72,8 +132,7 @@ def native_allowed() -> bool:
 
 
 def _any_untrusted() -> bool:
-    with resources_lock:
-        return any(res.alive and not res.trusted for res in resources.values())
+    return _has_untrusted
 
 
 def _audit(event, args):
@@ -94,8 +153,8 @@ def _audit(event, args):
             return
         res = current.get()
         if res is not None and not res.trusted:
-            roots = [res.directory, *prefix_roots()]
-        elif _any_untrusted():
+            roots = (res.directory, *prefix_roots())
+        elif _has_untrusted:
             roots = prefix_roots()
         else:
             return
@@ -152,13 +211,30 @@ def _note(text: str) -> None:
         return
 
 
+def _import_pip():
+    import pip  # noqa: F401
+
+    return pip
+
+
 def _ensure_pip() -> None:
     try:
-        import pip  # noqa: F401
+        _import_pip()
+        return
     except ModuleNotFoundError:
-        import ensurepip
+        pass
+    import site
 
-        ensurepip.bootstrap(upgrade=True)
+    site.main()
+    try:
+        _import_pip()
+        return
+    except ModuleNotFoundError:
+        pass
+    import ensurepip
+
+    ensurepip.bootstrap(upgrade=True)
+    _import_pip()
 
 
 def _refresh_imports() -> None:
@@ -256,6 +332,7 @@ def load_resource(name: str, directory: str, entry: str) -> int:
             res.trusted = bool(node.is_resource_trusted(name))
         except NodeError:
             res.trusted = False
+        _note_trust()
         io = host_io.set(True)
         try:
             with open(path, "r", encoding="utf-8") as handle:
@@ -281,6 +358,7 @@ def load_resource(name: str, directory: str, entry: str) -> int:
         bridge.call("log_error", f"python: {name} failed to load")
         return -1
     finally:
+        _note_trust()
         current.reset(token)
 
 
@@ -309,4 +387,5 @@ def unload_resource(name: str) -> None:
         with resources_lock:
             if resources.get(name) is res:
                 resources.pop(name, None)
+        _note_trust()
         current.reset(token)

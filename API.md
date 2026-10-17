@@ -30,7 +30,8 @@ node.log_info(' '.join(names))
 | `after` | ms, fn | Handle | То же, что set_timeout. |
 | `every` | ms, fn | Handle | То же, что set_interval. |
 | `cancel` | handle | None | Остановить таймер. |
-| `job` | fn, *args, done=None | None | fn на закреплённом ядре. done(result, error) на worker. |
+| `job` | fn, *args, done=None | Future \| None | fn на закреплённом ядре. В async def результат даёт await. done(result, error) на worker. |
+| `spawn` | coro | Task | Запустить корутину на worker. Пока она ждёт, worker свободен. |
 | `submit_job` | fn, *args, done=None | Handle | Пул сервера, без привязки к ядру. |
 | `core_info` | — | dict | index, processors, reserved, pinned, lane_id. |
 | `on_core` | — | bool | Сейчас код на lane. |

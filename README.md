@@ -2,7 +2,18 @@
 
 Языковой модуль сервера NodeMP. Кладётся в `modules/pyhost.dll` и регистрирует ресурсы `type = "python"`. Скрипт видит глобальный `node`. Это отдельный репозиторий от хоста MicroPython.
 
-Модуль и интерпретатор должны быть одной версии: эта сборка под Python 3.14 линкуется с `python314.dll`, сборка под 3.15 — с `python315.dll`. `python314.dll` в `modules/` класть нельзя: сервер пытается загрузить каждый DLL оттуда как модуль и отказывается, потому что у интерпретатора нет `node_plugin_abi`. Интерпретатор остаётся в своём каталоге, а перед запуском сервера задаётся `NODEMP_PYTHONHOME`.
+Модуль и интерпретатор должны быть одной версии. Раскладка рядом с сервером:
+
+```text
+modules/pyhost.dll
+modules/nodemp/
+modules/python_node/pyhost_core.dll
+modules/python_node/python314.dll
+modules/python_node/Lib/
+modules/python_node/DLLs/
+```
+
+`pyhost.dll` лежит прямо в `modules` и сам Python не импортирует. Он загружает `python_node\pyhost_core.dll`, а Windows вместе с ним находит `python314.dll` в той же папке. Сервер смотрит только корень `modules`, поэтому интерпретатор там не считается модулем. `NODEMP_PYTHONHOME` по-прежнему подменяет каталог со стандартной библиотекой.
 
 Полный список имён — в [API.md](API.md). Заголовок SDK, по которому собран хост, лежит в `sdk/node.h` (ABI 2.8). Сервер 1.12.0 говорит на ABI 2.7, поэтому в логе будет `NEWER SDK (2.8 vs 2.7)`. Функции только из 2.8 при вызове возвращают ошибку.
 
@@ -84,7 +95,7 @@ type = "python"
 main = "server/main.py"
 ```
 
-Примеры: `examples/hello`, `examples/python-gate`, `examples/python-async`. Последний оставляет вердикт запроса синхронным, а приветствие и перекличку считает через `node.job`.
+Примеры: `examples/hello`, `examples/python-gate`, `examples/python-async`. Последний оставляет вердикт запроса синхронным, а приветствие и перекличку пишет как `async def` и ждёт ядро через `await node.job`.
 
 `node` уже лежит в глобалах скрипта. `node.on("playerJoined", fn)` выбирает builtin, vehicle-событие, вердикт или клиентское событие по имени. Вердикт отказывает через `False` или строку причины; исключение в таком обработчике тоже отказ, traceback пишется в лог. `node.on_builtin`, `node.on_vehicle`, `node.on_request` и `node.on_client` выбирают канал явно.
 
@@ -110,7 +121,7 @@ cmake -S . -B build -DPython_ROOT_DIR=C:\Python314
 cmake --build build --config Release
 ```
 
-На Windows модуль линкуется с динамическим CRT (`/MD`), как официальный Python. Рядом с сервером должны оказаться `pyhost.dll`, `python314.dll` (или `python315.dll` той же сборки) и каталог `nodemp` (или `NODEMP_HOST_ROOT` указывает на папку, внутри которой лежит `nodemp`). `libnode`-схема та же, что у `js-host`: библиотека интерпретатора рядом с исполняемым файлом сервера.
+На Windows оба файла линкуются с динамическим CRT (`/MD`), как официальный Python. В `modules` кладётся `pyhost.dll`, в `modules/python_node` — `pyhost_core.dll` и сам интерпретатор. Каталог `nodemp` лежит рядом с `pyhost.dll` (или `NODEMP_HOST_ROOT` указывает на папку, внутри которой он есть).
 
 Если `node.h` вырос, заново сгенерируйте ctypes-слой:
 
@@ -127,7 +138,7 @@ py -3.14 tools/gen_api_md.py
 |---|---|
 | `NODEMP_PYTHON_CORE` | Номер процессора, `last` (по умолчанию) или `off` |
 | `NODEMP_PYTHON_RESERVE` | `0` — только приколоть lane, остальные потоки не двигать |
-| `NODEMP_PYTHONHOME` | Префикс интерпретатора, если Python не находится сам |
+| `NODEMP_PYTHONHOME` | Префикс интерпретатора. Без неё берётся `modules/python_node` |
 | `NODEMP_PYTHONPATH` | Дополнительные каталоги в `sys.path`, через `;` на Windows и `:` на Linux |
 | `NODEMP_HOST_ROOT` | Каталог, в котором лежит пакет `nodemp` |
 

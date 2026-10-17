@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from gen_abi import HEADER, parse_header  # noqa: E402
 from nodemp._abi import CATALOG, CONST, FUNCTION_ORDER, NodeApi, NodeVehicleControls, NodeVehicleInfo, NodeVehicleTransform  # noqa: E402
 from nodemp.api import BUILTIN, REQUESTS, VEHICLE, Node, _prepare, _write_reason, node  # noqa: E402
-from nodemp.runtime import install_system_hook, path_allowed, pip_argv
+from nodemp.runtime import install_system_hook, path_allowed, pip_argv, prefix_roots
 from nodemp.state import Resource, current  # noqa: E402
 
 HEADER_TEXT = HEADER.read_text(encoding="utf-8")
@@ -113,6 +113,16 @@ def test_cstr_arguments_are_encoded():
     assert _prepare("set_resource_owner", (b"python-gate",)) == (b"python-gate",)
 
 
+def test_user_site_is_a_prefix_root():
+    import site
+
+    user = site.getusersitepackages()
+    roots = prefix_roots()
+    assert user in roots
+    sample = os.path.join(user, "uvicorn", "loops", "__init__.py")
+    assert path_allowed(sample, roots)
+
+
 def test_plain_pip_command_stays_inside_the_host():
     assert pip_argv("pip install requests") == ["install", "requests"]
     assert pip_argv("pip install foo==1.2.3") == ["install", "foo==1.2.3"]
@@ -138,6 +148,67 @@ def test_untrusted_pip_stays_closed():
     finally:
         os.system = original
         current.reset(token)
+
+
+def test_async_handler_keeps_the_resource_across_await():
+    import asyncio
+
+    import nodemp.api as api
+    from nodemp.api import _finish_sync, _run_pump, spawn_coro
+
+    pumps = []
+    api._pump_hook = pumps.append
+    api._pump_armed = False
+    seen = []
+    res = Resource("python-async", "C:/resources/python-async")
+    res.alive = True
+    res.trusted = True
+
+    async def work():
+        seen.append(current.get().name)
+        await asyncio.sleep(0)
+        seen.append(current.get().name)
+
+    token = current.set(res)
+    try:
+        spawn_coro(work())
+        assert current.get() is res
+    finally:
+        current.reset(token)
+
+    for _ in range(4):
+        if len(seen) == 2:
+            break
+        api._pump_armed = False
+        _run_pump(0)
+
+    api._pump_hook = None
+    api._pump_armed = False
+    loop = api._host_loop
+    if loop is not None and not loop.is_closed():
+        loop.close()
+        api._host_loop = None
+    assert seen == ["python-async", "python-async"]
+    assert pumps
+
+    async def allow():
+        return "kept"
+
+    assert _finish_sync(allow()) == "kept"
+
+    class _Once:
+        def __await__(self):
+            yield
+
+    async def waits():
+        await _Once()
+
+    try:
+        _finish_sync(waits())
+    except RuntimeError as exc:
+        assert "await" in str(exc)
+    else:
+        raise AssertionError("a request coroutine was allowed to await")
 
 
 def load_tests(loader, tests, pattern):

@@ -79,6 +79,7 @@ typedef struct Job {
 typedef struct DoneBox {
     PyObject* done;
     PyObject* args;
+    struct DoneBox* next;
 } DoneBox;
 
 static const NodeApi* g_api;
@@ -89,6 +90,9 @@ static int g_live;
 static Job* g_head;
 static Job* g_tail;
 static int g_count;
+static DoneBox* g_done_head;
+static DoneBox* g_done_tail;
+static int g_done_armed;
 static int g_ready_flag;
 static int g_lane_up;
 static int g_thread_started;
@@ -101,6 +105,8 @@ static unsigned long long g_reserve_log_at;
 static CRITICAL_SECTION g_mu;
 static CONDITION_VARIABLE g_cv;
 static CRITICAL_SECTION g_reserve_mu;
+static CRITICAL_SECTION g_done_mu;
+static int g_done_mu_ready;
 static HANDLE g_thread;
 static DWORD g_lane_tid;
 static HMODULE g_module;
@@ -108,6 +114,7 @@ static HMODULE g_module;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t g_reserve_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_done_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_thread;
 static pthread_t g_lane_thread;
 static int g_lane_valid;
@@ -149,6 +156,39 @@ static void q_wait(void) {
     SleepConditionVariableCS(&g_cv, &g_mu, INFINITE);
 #else
     pthread_cond_wait(&g_cv, &g_mu);
+#endif
+}
+
+/* 1 when the queue was signalled, 0 when the wait timed out. */
+static int q_wait_ms(unsigned ms) {
+#if defined(_WIN32)
+    return SleepConditionVariableCS(&g_cv, &g_mu, ms) ? 1 : 0;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += (time_t)(ms / 1000u);
+    ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
+    }
+    return pthread_cond_timedwait(&g_cv, &g_mu, &ts) == 0;
+#endif
+}
+
+static void done_lock(void) {
+#if defined(_WIN32)
+    if (g_done_mu_ready) EnterCriticalSection(&g_done_mu);
+#else
+    pthread_mutex_lock(&g_done_mu);
+#endif
+}
+
+static void done_unlock(void) {
+#if defined(_WIN32)
+    if (g_done_mu_ready) LeaveCriticalSection(&g_done_mu);
+#else
+    pthread_mutex_unlock(&g_done_mu);
 #endif
 }
 
@@ -307,12 +347,6 @@ static void core_reserve(void) {
 #endif
 }
 
-static void reserve_timer(int timer_id, void* user) {
-    (void)timer_id;
-    (void)user;
-    core_reserve();
-}
-
 static int enqueue_locked(Job* job) {
     if (!g_lane_up || STOP_GET() || g_count >= JOB_CAP) return 0;
     job->next = NULL;
@@ -378,19 +412,71 @@ static void log_current_error(const char* prefix) {
     PyErr_Clear();
 }
 
-static void deliver_done(int timer_id, void* user) {
-    DoneBox* box = (DoneBox*)user;
-    PyGILState_STATE gs;
-    PyObject* ret;
-    (void)timer_id;
-    gs = PyGILState_Ensure();
-    ret = PyObject_CallObject(box->done, box->args);
-    if (!ret) log_current_error("python job callback");
-    else Py_DECREF(ret);
-    Py_DECREF(box->done);
-    Py_DECREF(box->args);
+static void discard_done_list(DoneBox* box) {
+    PyGILState_STATE gs = PyGILState_Ensure();
+    while (box) {
+        DoneBox* next = box->next;
+        PyObject* error = NULL;
+        if (box->args && PyTuple_Check(box->args) && PyTuple_GET_SIZE(box->args) >= 2) error = PyTuple_GET_ITEM(box->args, 1);
+        if (error && error != Py_None) log_unicode(error);
+        Py_DECREF(box->done);
+        Py_DECREF(box->args);
+        free(box);
+        box = next;
+    }
     PyGILState_Release(gs);
-    free(box);
+}
+
+static void deliver_done(int timer_id, void* user) {
+    DoneBox* box;
+    PyGILState_STATE gs;
+    (void)timer_id;
+    (void)user;
+    done_lock();
+    box = g_done_head;
+    g_done_head = NULL;
+    g_done_tail = NULL;
+    g_done_armed = 0;
+    done_unlock();
+    if (!box) return;
+    gs = PyGILState_Ensure();
+    while (box) {
+        DoneBox* next = box->next;
+        PyObject* ret = PyObject_CallObject(box->done, box->args);
+        if (!ret) log_current_error("python job callback");
+        else Py_DECREF(ret);
+        Py_DECREF(box->done);
+        Py_DECREF(box->args);
+        free(box);
+        box = next;
+    }
+    PyGILState_Release(gs);
+}
+
+/* One worker wakeup for every completion that lands before that wakeup runs. */
+static int done_schedule(DoneBox* box) {
+    int arm = 0;
+    DoneBox* failed;
+    box->next = NULL;
+    done_lock();
+    if (g_done_tail) g_done_tail->next = box;
+    else g_done_head = box;
+    g_done_tail = box;
+    if (!g_done_armed) {
+        g_done_armed = 1;
+        arm = 1;
+    }
+    done_unlock();
+    if (!arm) return 1;
+    if (g_api && g_api->set_timeout && g_api->set_timeout(0, deliver_done, NULL) >= 0) return 1;
+    done_lock();
+    failed = g_done_head;
+    g_done_head = NULL;
+    g_done_tail = NULL;
+    g_done_armed = 0;
+    done_unlock();
+    discard_done_list(failed);
+    return 0;
 }
 
 static void discard_py(Job* job) {
@@ -416,18 +502,17 @@ static void run_py(Job* job) {
             box->args = Py_BuildValue("OO", result ? result : Py_None, error ? error : Py_None);
             if (box->args) {
                 PyGILState_Release(gs);
-                if (g_api->set_timeout(0, deliver_done, box) >= 0) scheduled = 1;
+                scheduled = done_schedule(box);
                 gs = PyGILState_Ensure();
+                box = NULL;
             }
         }
     }
-    if (!scheduled) {
+    if (!scheduled && box) {
         if (error) log_unicode(error);
-        if (box) {
-            Py_XDECREF(box->done);
-            Py_XDECREF(box->args);
-            free(box);
-        }
+        Py_XDECREF(box->done);
+        Py_XDECREF(box->args);
+        free(box);
     }
     Py_XDECREF(result);
     Py_XDECREF(error);
@@ -457,7 +542,13 @@ static void lane_body(void) {
     for (;;) {
         Job* job;
         int stopping;
-        while (!STOP_GET() && g_head == NULL) q_wait();
+        while (!STOP_GET() && g_head == NULL) {
+            if (q_wait_ms(5000)) continue;
+            /* Snapshotting every thread is slow. Do it on the lane, not the worker. */
+            q_unlock();
+            core_reserve();
+            q_lock();
+        }
         if (g_head == NULL) {
             q_unlock();
             return;
@@ -533,6 +624,8 @@ static int core_start(void) {
     InitializeCriticalSection(&g_mu);
     InitializeConditionVariable(&g_cv);
     InitializeCriticalSection(&g_reserve_mu);
+    InitializeCriticalSection(&g_done_mu);
+    g_done_mu_ready = 1;
 #endif
     g_ncpu = processor_count();
     g_core = choose_core();
@@ -910,6 +1003,96 @@ static int find_root(char* out, size_t n) {
     return 0;
 }
 
+static int has_stdlib(const char* dir) {
+    char probe[4096];
+    if (!dir || !dir[0]) return 0;
+    if (join_path(probe, sizeof probe, dir, "Lib/os.py") && utf8_exists(probe)) return 1;
+    return join_path(probe, sizeof probe, dir, "lib/python3.14/os.py") && utf8_exists(probe);
+}
+
+static void trim_dir(char* text) {
+    size_t len = strlen(text);
+    while (len > 0 && (text[len - 1] == '/' || text[len - 1] == '\\')) text[--len] = '\0';
+}
+
+#if defined(_WIN32)
+static int home_from_module(const wchar_t* name, char* out, size_t n) {
+    HMODULE mod = GetModuleHandleW(name);
+    wchar_t wide[4096];
+    char path[4096];
+    char* slash;
+    DWORD got;
+    if (!mod) return 0;
+    got = GetModuleFileNameW(mod, wide, 4096);
+    if (got == 0 || got >= 4096) return 0;
+    if (WideCharToMultiByte(CP_UTF8, 0, wide, -1, path, (int)sizeof path, NULL, NULL) <= 0) return 0;
+    slash = strrchr(path, '\\');
+    if (!slash) slash = strrchr(path, '/');
+    if (!slash) return 0;
+    *slash = '\0';
+    if (!has_stdlib(path)) return 0;
+    return copy_str(out, n, path);
+}
+
+static int home_from_registry(HKEY root, const char* sub, char* out, size_t n) {
+    HKEY key;
+    char buf[4096];
+    DWORD size = (DWORD)sizeof buf;
+    DWORD type = 0;
+    if (RegOpenKeyExA(root, sub, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) return 0;
+    if (RegQueryValueExA(key, NULL, NULL, &type, (LPBYTE)buf, &size) != ERROR_SUCCESS ||
+        (type != REG_SZ && type != REG_EXPAND_SZ) || size == 0 || size >= sizeof buf) {
+        RegCloseKey(key);
+        return 0;
+    }
+    RegCloseKey(key);
+    buf[sizeof buf - 1] = '\0';
+    trim_dir(buf);
+    if (!has_stdlib(buf)) return 0;
+    return copy_str(out, n, buf);
+}
+
+static int home_from_bundle(char* out, size_t n) {
+    char dir[4096];
+    char bundled[4096];
+    const char* name;
+    if (!module_dir(dir, sizeof dir)) return 0;
+    if (has_stdlib(dir)) return copy_str(out, n, dir);
+    name = strrchr(dir, '/');
+    if (!name) name = strrchr(dir, '\\');
+    name = name ? name + 1 : dir;
+    if (strcmp(name, "python_node") == 0) return 0;
+    if (!join_path(bundled, sizeof bundled, dir, "python_node")) return 0;
+    if (!has_stdlib(bundled)) return 0;
+    return copy_str(out, n, bundled);
+}
+
+static int discover_home(char* out, size_t n) {
+    static const wchar_t* mods[] = {L"python314.dll", L"python315.dll", NULL};
+    static const char* keys[] = {
+        "Software\\Python\\PythonCore\\3.14\\InstallPath",
+        "Software\\Python\\PythonCore\\3.15\\InstallPath",
+        NULL,
+    };
+    int i;
+    if (home_from_bundle(out, n)) return 1;
+    for (i = 0; mods[i]; i++) {
+        if (home_from_module(mods[i], out, n)) return 1;
+    }
+    for (i = 0; keys[i]; i++) {
+        if (home_from_registry(HKEY_CURRENT_USER, keys[i], out, n)) return 1;
+        if (home_from_registry(HKEY_LOCAL_MACHINE, keys[i], out, n)) return 1;
+    }
+    return 0;
+}
+#else
+static int discover_home(char* out, size_t n) {
+    (void)out;
+    (void)n;
+    return 0;
+}
+#endif
+
 static wchar_t* widen_utf8(const char* text) {
 #if defined(_WIN32)
     int count = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
@@ -1023,6 +1206,7 @@ NODE_EXPORT int node_plugin_init(const NodeApi* api) {
     wchar_t* home = NULL;
     const char* home_env;
     char root[4096];
+    char found[4096];
     char banner[512];
     char version[160];
     const char* full;
@@ -1048,6 +1232,16 @@ NODE_EXPORT int node_plugin_init(const NodeApi* api) {
     config.configure_c_stdio = 0;
     config.buffered_stdio = 1;
     home_env = getenv("NODEMP_PYTHONHOME");
+    found[0] = '\0';
+    if (!home_env || !home_env[0]) {
+        if (discover_home(found, sizeof found)) {
+            snprintf(banner, sizeof banner, "python home is %s", found);
+            log_line(banner);
+            home_env = found;
+        } else {
+            log_err("Python was not found in modules/python_node. Copy the install there (it needs Lib and python314.dll) or set NODEMP_PYTHONHOME");
+        }
+    }
     if (home_env && home_env[0]) {
         home = widen_utf8(home_env);
         if (!home) {
@@ -1125,7 +1319,6 @@ NODE_EXPORT int node_plugin_init(const NodeApi* api) {
         Py_FinalizeEx();
         return -1;
     }
-    if (api->set_interval) api->set_interval(5000u, reserve_timer, NULL);
     full = Py_GetVersion();
     for (i = 0; full && full[i] && full[i] != '\n' && i + 1 < sizeof version; i++) version[i] = full[i];
     version[i] = '\0';
