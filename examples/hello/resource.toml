@@ -1,0 +1,5 @@
+name = "hello-py"
+type = "python"
+
+[server]
+main = "server/main.py"

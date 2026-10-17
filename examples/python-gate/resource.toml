@@ -1,0 +1,10 @@
+name = "python-gate"
+version = "1.0"
+type = "python"
+
+# Приветствие и два синхронных запрета. Скопируйте всю папку в resources/
+# рядом с server.toml. В modules/ нужны pyhost.dll и python315.dll.
+# Без хоста сервер напишет, что тип "python" никто не обслуживает, и пропустит ресурс.
+
+[server]
+main = "server/main.py"
